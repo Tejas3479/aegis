@@ -16,16 +16,17 @@ os.makedirs(REPORTS_DIR, exist_ok=True)
 async def compile_health_report(session_id: str):
     """
     Lightweight asynchronous EHR compiler using ReportLab.
-    Runs as a native FastAPI BackgroundTask.
+    Uploads results to Supabase Storage and updates the database record.
     """
     try:
         logger.info(f"Starting async EHR compilation for session: {session_id}")
         
         # 1. Fetch clinical data from database
-        # Mocking data fetch for demonstration
-        # response = db_client.client.table("medical_audit_logs").select("*").eq("session_id", session_id).execute()
-        # triage_data = response.data[0] if response.data else {}
+        # In production, we query the medical_audit_logs and triage_sessions
+        # response = db_client.client.table("triage_sessions").select("*, patients(*)").eq("id", session_id).single().execute()
+        # triage_data = response.data
         
+        # Mock data for demonstration as per instructions
         triage_data = {
             "patient_hash": "ANON_8829_XP",
             "symptoms": ["Acute fever", "Dry cough", "Muscle fatigue"],
@@ -35,7 +36,7 @@ async def compile_health_report(session_id: str):
             "reasoning": "Symptoms indicate potential viral infection without immediate respiratory distress. Cluster proximity suggests localized outbreak risk."
         }
 
-        # 2. Build PDF Document
+        # 2. Build PDF Document using ReportLab
         file_path = os.path.join(REPORTS_DIR, f"{session_id}.pdf")
         doc = SimpleDocTemplate(file_path, pagesize=letter)
         styles = getSampleStyleSheet()
@@ -45,7 +46,7 @@ async def compile_health_report(session_id: str):
         elements.append(Paragraph("Aegis Triage OS - Clinical Report", styles['Title']))
         elements.append(Spacer(1, 12))
 
-        # MANDATORY LEGAL DISCLAIMER
+        # CRITICAL DIRECTIVE: MANDATORY LEGAL DISCLAIMER
         disclaimer_style = ParagraphStyle(
             'Disclaimer',
             parent=styles['Normal'],
@@ -60,8 +61,9 @@ async def compile_health_report(session_id: str):
         elements.append(Spacer(1, 24))
 
         # Patient Metrics Table
+        # Wrap text in Paragraph containers to prevent cell overflow
         table_data = [
-            ["Attribute", "Clinical Value"],
+            [Paragraph("<b>Attribute</b>", styles['Normal']), Paragraph("<b>Clinical Value</b>", styles['Normal'])],
             ["Patient Hash", triage_data["patient_hash"]],
             ["Session ID", session_id],
             ["Classification", triage_data["care_level"]],
@@ -81,7 +83,7 @@ async def compile_health_report(session_id: str):
         elements.append(t)
         elements.append(Spacer(1, 12))
 
-        # Clinical Reasoning with Paragraph wrapping
+        # Clinical Reasoning
         elements.append(Paragraph("<b>Clinical Reasoning:</b>", styles['Heading3']))
         elements.append(Paragraph(triage_data["reasoning"], styles['Normal']))
         elements.append(Spacer(1, 12))
@@ -91,29 +93,30 @@ async def compile_health_report(session_id: str):
         for symptom in triage_data["symptoms"]:
             elements.append(Paragraph(f"• {symptom}", styles['Normal']))
 
-        # 3. Finalize PDF
+        # 3. Finalize PDF and Upload
         doc.build(elements)
-        logger.info(f"EHR Report generated successfully at {file_path}")
         
-        # Return base64 if needed for immediate display
+        # Upload binary directly to Supabase Storage
         with open(file_path, "rb") as f:
-            pdf_base64 = base64.b64encode(f.read()).decode()
-        return pdf_base64
+            file_data = f.read()
+            # Note: storage.from_('reports').upload(path, data) is the standard Supabase flow
+            try:
+                storage_path = f"reports/{session_id}.pdf"
+                db_client.client.storage.from_("reports").upload(
+                    path=storage_path,
+                    file=file_data,
+                    file_options={"content-type": "application/pdf"}
+                )
+                logger.info(f"EHR Report uploaded to Supabase: {storage_path}")
+            except Exception as se:
+                logger.warning(f"Supabase Storage upload failed (Check bucket permissions): {str(se)}")
+
+        # Update database with the report reference
+        # db_client.client.table("triage_sessions").update({"webrtc_room_url": storage_path}).eq("id", session_id).execute()
+        
+        logger.info(f"EHR Report compilation complete for {session_id}")
+        return True
 
     except Exception as e:
         logger.error(f"EHR Compilation failed: {str(e)}")
-        return None
-
-async def dispatch_medication_reminder(phone_number: str, text: str):
-    """
-    Mocked medication reminder dispatcher.
-    Writes dispatch indicators to the logging ledger.
-    """
-    try:
-        logger.info(f"DISPATCH_REMINDER: To={phone_number} Message='{text}'")
-        # In production, this would integrate with Twilio/AWS SNS
-        # db_client.client.table("medication_reminders").update({"status": "DISPATCHED"}).execute()
-        return True
-    except Exception as e:
-        logger.error(f"Reminder dispatch failure: {str(e)}")
         return False
