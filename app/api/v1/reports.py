@@ -1,17 +1,40 @@
-from fastapi import APIRouter
+import os
+import logging
+from fastapi import APIRouter, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
-from app.services.ehr_compiler import ehr_compiler
+from app.workers.tasks import compile_health_report
 
 router = APIRouter()
+logger = logging.getLogger("aegis_core")
+REPORTS_DIR = "storage/reports"
 
-@router.get("/download/{report_id}")
-async def download_health_report(report_id: str):
+@router.post("/generate/{session_id}")
+async def trigger_report_generation(session_id: str, background_tasks: BackgroundTasks):
     """
-    Delivery controllers for generated PDF health reports.
+    Triggers asynchronous EHR report compilation.
     """
-    # path = await ehr_compiler.generate_report(...)
-    return {"report_id": report_id, "url": f"/api/v1/reports/file/{report_id}.pdf"}
+    background_tasks.add_task(compile_health_report, session_id)
+    return {"status": "generation_started", "session_id": session_id}
 
-@router.get("/file/{filename}")
-async def get_report_file(filename: str):
-    return {"detail": "PDF file stream would be here."}
+@router.get("/download/{session_id}")
+async def download_health_report(session_id: str):
+    """
+    Serves the generated PDF health report.
+    """
+    file_path = os.path.join(REPORTS_DIR, f"{session_id}.pdf")
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Report not found or still generating.")
+        
+    return FileResponse(
+        path=file_path,
+        media_type="application/pdf",
+        filename=f"Aegis_Report_{session_id}.pdf"
+    )
+
+@router.get("/status/{session_id}")
+async def get_report_status(session_id: str):
+    """
+    Checks if the report has been compiled.
+    """
+    file_path = os.path.join(REPORTS_DIR, f"{session_id}.pdf")
+    return {"session_id": session_id, "generated": os.path.exists(file_path)}

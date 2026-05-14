@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from supabase import create_client, Client
 from app.core.config import settings
 
@@ -13,14 +14,21 @@ class DatabaseClient:
 
     async def connect(self):
         """
-        Initializes the Supabase client connection.
+        Initializes the Supabase client connection with enterprise-grade retries.
         """
-        try:
-            self.client = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
-            logger.info("Successfully connected to Supabase/PostgreSQL pool.")
-        except Exception as e:
-            logger.error(f"Failed to connect to database: {str(e)}")
-            raise e
+        retries = 3
+        for i in range(retries):
+            try:
+                self.client = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
+                logger.info("Successfully connected to Supabase/PostgreSQL pool.")
+                return
+            except Exception as e:
+                if i == retries - 1:
+                    logger.critical(f"Final database connection attempt failed: {str(e)}")
+                    raise e
+                wait = (i + 1) * 2
+                logger.warning(f"Database connection attempt {i+1} failed. Retrying in {wait}s...")
+                await asyncio.sleep(wait)
 
     async def disconnect(self):
         """

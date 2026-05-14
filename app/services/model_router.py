@@ -1,41 +1,99 @@
 import logging
+import json
+from typing import Dict, Any
 from google import genai
+from google.genai import types
 from app.core.config import settings
 
-logger = logging.getLogger("aegis_core")
+from app.core.resilience import CircuitBreaker, retry_with_backoff
+
+logger = logging.getLogger("aegis_enterprise.model_router")
+router_breaker = CircuitBreaker(failure_threshold=3, recovery_timeout=60)
 
 class ModelRouter:
     """
-    Intelligent multi-model LLM router with absolute failovers using Google GenAI SDK.
+    Cognitive heuristic multi-model router with absolute failovers.
+    Dynamically allocates compute based on intent and clinical complexity.
     """
-    def __init__(self):
-        self.client = genai.Client(api_key=settings.GOOGLE_GENAI_API_KEY)
-        self.primary_model = "gemini-1.5-pro"
-        self.fallback_model = "gemini-1.5-flash"
+    
+    # Static fallback matrix for clinical triage when API is unreachable
+    STATIC_TRIAGE_TEMPLATE = {
+        "intent": "TRIAGE",
+        "detected_lang": "en",
+        "complexity_score": 1.0,
+        "prediction": "FALLBACK_MODE",
+        "guidance": "System is in safety fallback. Please proceed with standard emergency protocols if symptoms are severe."
+    }
 
-    async def get_response(self, prompt: str, use_pro: bool = True) -> str:
-        """
-        Routes query to the optimal model with absolute failover to the flash engine.
-        """
-        target_model = self.primary_model if use_pro else self.fallback_model
+    def __init__(self):
         try:
-            logger.info(f"Attempting inference with {target_model}")
-            response = self.client.models.generate_content(
-                model=target_model,
-                contents=prompt
-            )
-            return response.text
+            self.client = genai.Client(api_key=settings.GOOGLE_GENAI_API_KEY)
+            self.fast_model = "gemini-2.5-flash"
+            self.pro_model = "gemini-2.5-pro"
         except Exception as e:
-            logger.error(f"Primary model {target_model} failed: {str(e)}. Triggering failover...")
-            # Absolute failover to fallback model
-            try:
-                response = self.client.models.generate_content(
-                    model=self.fallback_model,
-                    contents=prompt
+            logger.critical(f"GenAI Client initialization failed: {str(e)}")
+            raise e
+
+    @router_breaker
+    @retry_with_backoff(retries=2)
+    async def route_request(self, sanitized_text: str) -> Dict[str, Any]:
+        """
+        Executes fast-path analysis and routes targets to optimal compute engines.
+        """
+        try:
+            # 1. Fast-path analysis targeting gemini-2.5-flash
+            analysis_prompt = (
+                f"Analyze the following medical query and return a JSON object with 'intent' (ADMIN, FAQ, or TRIAGE), "
+                f"'detected_lang' (ISO code), and 'complexity_score' (float 0.0 to 1.0).\n\nQuery: {sanitized_text}"
+            )
+            
+            # Forcing JSON schema response
+            response = self.client.models.generate_content(
+                model=self.fast_model,
+                contents=analysis_prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema={
+                        "type": "OBJECT",
+                        "properties": {
+                            "intent": {"type": "STRING"},
+                            "detected_lang": {"type": "STRING"},
+                            "complexity_score": {"type": "NUMBER"}
+                        },
+                        "required": ["intent", "detected_lang", "complexity_score"]
+                    }
                 )
-                return response.text
-            except Exception as fatal_e:
-                logger.critical(f"Failover model {self.fallback_model} also failed: {str(fatal_e)}")
-                raise fatal_e
+            )
+            
+            analysis = json.loads(response.text)
+            intent = analysis.get("intent", "FAQ")
+            complexity = analysis.get("complexity_score", 0.0)
+            detected_lang = analysis.get("detected_lang", "en")
+            
+            translation_required = detected_lang != "en"
+            
+            # 2. Execution path allocation rules
+            target_model = self.fast_model
+            if intent == "TRIAGE" or complexity > 0.65:
+                target_model = self.pro_model
+                logger.info(f"Escalating request to {self.pro_model} (Complexity: {complexity})")
+            else:
+                logger.info(f"Routing request to {self.fast_model} (Intent: {intent})")
+                
+            # 3. Final model execution (scaffolded)
+            # In a full implementation, this would call the target_model for the actual response
+            return {
+                "intent": intent,
+                "complexity_score": complexity,
+                "detected_lang": detected_lang,
+                "translation_required": translation_required,
+                "target_engine": target_model,
+                "status": "routed"
+            }
+
+        except Exception as e:
+            # CRITICAL STABILITY EDGE: Catch rate limits (429) or API exceptions
+            logger.error(f"Routing logic failure: {str(e)}. Triggering clinical fallback matrix.")
+            return self.STATIC_TRIAGE_TEMPLATE
 
 llm_router = ModelRouter()
